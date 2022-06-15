@@ -1,92 +1,69 @@
+#!/usr/bin/python
 # -*- coding: utf-8 -*-
-"""
-@author: jemmy li
-@contact: zengarden2009@gmail.com
-"""
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
+from __future__ import absolute_import, division, print_function
 
+import numpy as np
 import tensorflow as tf
 
 
-def _smooth_l1_loss_base(bbox_pred, bbox_targets, sigma=1.0):
+def l1_smooth_losses(predict_boxes, gtboxes, object_weights, classes_weights=None):
+  '''
+  :param predict_boxes: [minibatch_size, -1]
+  :param gtboxes: [minibatch_size, -1]
+  :param object_weights: [minibatch_size, ]. 1.0 represent object, 0.0 represent others(ignored or background)
+  :return:
+  '''
+  diff = predict_boxes - gtboxes
+  abs_diff = tf.cast(tf.abs(diff), tf.float32)
+
+  if classes_weights is None:
     '''
-
-    :param bbox_pred: [-1, 4] in RPN. [-1, cls_num+1, 4] in Fast-rcnn
-    :param bbox_targets: shape is same as bbox_pred
-    :param sigma:
-    :return:
+    first_stage:
+    predict_boxes :[minibatch_size, 4]
+    gtboxes: [minibatchs_size, 4]
     '''
-    sigma_2 = sigma**2
-
-    box_diff = bbox_pred - bbox_targets
-
-    abs_box_diff = tf.abs(box_diff)
-
-    smoothL1_sign = tf.stop_gradient(
-        tf.to_float(tf.less(abs_box_diff, 1. / sigma_2)))
-    loss_box = tf.pow(box_diff, 2) * (sigma_2 / 2.0) * smoothL1_sign \
-               + (abs_box_diff - (0.5 / sigma_2)) * (1.0 - smoothL1_sign)
-    return loss_box
-
-def smooth_l1_loss_rpn(bbox_pred, bbox_targets, label, sigma=1.0):
+    anchorwise_smooth_l1norm = tf.reduce_sum(
+        tf.where(tf.less(abs_diff, 1), 0.5 * tf.square(abs_diff), abs_diff - 0.5), axis=1) * object_weights
+  else:
     '''
-
-    :param bbox_pred: [-1, 4]
-    :param bbox_targets: [-1, 4]
-    :param label: [-1]
-    :param sigma:
-    :return:
+    fast_rcnn:
+    predict_boxes: [minibatch_size, 4*num_classes]
+    gtboxes: [minibatch_size, 4*num_classes]
+    classes_weights : [minibatch_size, 4*num_classes]
     '''
-    value = _smooth_l1_loss_base(bbox_pred, bbox_targets, sigma=sigma)
-    value = tf.reduce_sum(value, axis=1)  # to sum in axis 1
-    rpn_positive = tf.where(tf.greater(label, 0))
+    anchorwise_smooth_l1norm = tf.reduce_sum(tf.where(tf.less(abs_diff, 1), 0.5*tf.square(
+        abs_diff)*classes_weights, (abs_diff - 0.5)*classes_weights), axis=1)*object_weights
+  return tf.reduce_mean(anchorwise_smooth_l1norm, axis=0)  # reduce mean
 
-    # rpn_select = tf.stop_gradient(rpn_select) # to avoid
-    selected_value = tf.gather(value, rpn_positive)
-    non_ignored_mask = tf.stop_gradient(
-        1.0 - tf.to_float(tf.equal(label, -1)))  # positve is 1.0 others is 0.0
 
-    bbox_loss = tf.reduce_sum(selected_value) / tf.maximum(1.0, tf.reduce_sum(non_ignored_mask))
+def weighted_softmax_cross_entropy_loss(predictions, labels, weights):
+  '''
+  :param predictions:
+  :param labels:
+  :param weights: [N, ] 1 -> should be sampled , 0-> not should be sampled
+  :return:
+  '''
+  per_row_cross_ent = tf.nn.softmax_cross_entropy_with_logits(logits=predictions,
+                                                              labels=labels)
 
-    return bbox_loss
+  weighted_cross_ent = tf.reduce_sum(per_row_cross_ent * weights)
+  return weighted_cross_ent / tf.reduce_sum(weights)
 
-def smooth_l1_loss_rcnn(bbox_pred, bbox_targets, label, num_classes, sigma=1.0):
-    '''
 
-    :param bbox_pred: [-1, (cfgs.CLS_NUM +1) * 4]
-    :param bbox_targets:[-1, (cfgs.CLS_NUM +1) * 4]
-    :param label:[-1]
-    :param num_classes:
-    :param sigma:
-    :return:
-    '''
+def test_smoothl1():
+  predict_boxes = tf.constant([[1, 1, 2, 2],
+                               [2, 2, 2, 2],
+                               [3, 3, 3, 3]])
+  gtboxes = tf.constant([[1, 1, 1, 1],
+                         [2, 1, 1, 1],
+                         [3, 3, 2, 1]])
 
-    outside_mask = tf.stop_gradient(tf.to_float(tf.greater(label, 0)))
+  classes_weights = tf.constant([[0.8], [0.9], [0.8]])
+  loss = l1_smooth_losses(predict_boxes, gtboxes, [1, 1, 1], classes_weights=classes_weights)
 
-    bbox_pred = tf.reshape(bbox_pred, [-1, num_classes, 4])
-    bbox_targets = tf.reshape(bbox_targets, [-1, num_classes, 4])
+  with tf.Session() as sess:
+    print(sess.run(loss))
 
-    value = _smooth_l1_loss_base(bbox_pred,
-                                 bbox_targets,
-                                 sigma=sigma)
-    value = tf.reduce_sum(value, 2)
-    value = tf.reshape(value, [-1, num_classes])
 
-    inside_mask = tf.one_hot(tf.reshape(label, [-1, 1]),
-                             depth=num_classes, axis=1)
-
-    inside_mask = tf.stop_gradient(
-        tf.to_float(tf.reshape(inside_mask, [-1, num_classes])))
-
-    normalizer = tf.to_float(tf.shape(bbox_pred)[0])
-    bbox_loss = tf.reduce_sum(
-        tf.reduce_sum(value * inside_mask, 1)*outside_mask) / normalizer
-
-    return bbox_loss
-
-def sum_ohem_loss(cls_score, label, bbox_pred, bbox_targets,
-                  nr_ohem_sampling, nr_classes, sigma=1.0):
-
-    raise NotImplementedError('not implement Now. YJR will implemetn in the future')
+if __name__ == '__main__':
+  test_smoothl1()

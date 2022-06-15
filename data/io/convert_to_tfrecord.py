@@ -7,19 +7,20 @@ import xml.etree.cElementTree as ET
 
 import cv2
 import numpy as np
-import tensorflow as tf
+import tempfile
+import tensorflow.compat.v1 as tf
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
-from help_utils.tools import *
-from libs.configs import cfgs
-from libs.label_name_dict.label_dict import *
+from FPN_TensorFlow.help_utils.tools import *
+from FPN_TensorFlow.libs.configs import cfgs
+from FPN_TensorFlow.libs.label_name_dict.label_dict import *
 
 tf.app.flags.DEFINE_string('VOC_dir', '../{}/'.format(cfgs.DATASET_NAME), 'Voc dir')
 tf.app.flags.DEFINE_string('xml_dir', 'Annotations', 'xml dir')
 tf.app.flags.DEFINE_string('image_dir', 'JPEGImages/', 'image dir')
 tf.app.flags.DEFINE_string('save_name', 'train', 'save name')
-tf.app.flags.DEFINE_string('save_dir', cfgs.ROOT_PATH + './data/tfrecords/', 'save name')
+tf.app.flags.DEFINE_string('save_dir', cfgs.ROOT_PATH + '/data/tfrecords/', 'save name')
 tf.app.flags.DEFINE_string('img_format', '.jpeg', 'format of image')
 FLAGS = tf.app.flags.FLAGS
 
@@ -103,21 +104,17 @@ def read_image(path):
 
   return im
 
+def convert_pascal_to_tfrecord(xml_path, image_path):
 
-def convert_pascal_to_tfrecord():
-
-  xml_path = FLAGS.VOC_dir + FLAGS.xml_dir
-  image_path = FLAGS.VOC_dir + FLAGS.image_dir
+  # xml_path = FLAGS.VOC_dir + FLAGS.xml_dir
+  # image_path = FLAGS.VOC_dir + FLAGS.image_dir
   save_path = FLAGS.save_dir + cfgs.DATASET_NAME + '_' + FLAGS.save_name + '.tfrecord'
   mkdir(FLAGS.save_dir)
 
-  # writer_options = tf.python_io.TFRecordOptions(tf.python_io.TFRecordCompressionType.ZLIB)
-  # writer = tf.python_io.TFRecordWriter(path=save_path, options=writer_options)
   writer = tf.python_io.TFRecordWriter(path=save_path)
 
   xmls = [os.path.join(xml_path, f).replace('jpeg', 'xml')
           for f in os.listdir(image_path) if not f.startswith('.')]
-          # for f in os.listdir(image_path) if not f.startswith('.') and int(f[:6]) > split]
 
   print('{} in train...'.format(len(xmls)))
 
@@ -157,14 +154,14 @@ def convert_pascal_to_tfrecord():
       view_bar('Conversion progress', count + 1, len(xmls))
 
   print('\nConversion is completed!')
+  return save_path
 
+def convert_pascal_to_test_tfrecord(xml_path, image_path):
+  temp_dir = tempfile.mkdtemp()
+  if not os.path.isdir(temp_dir):
+    mkdir(temp_dir)
 
-def convert_pascal_to_test_tfrecord():
-
-  xml_path = FLAGS.VOC_dir + FLAGS.xml_dir
-  image_path = FLAGS.VOC_dir + FLAGS.image_dir
-  save_path = FLAGS.save_dir + cfgs.DATASET_NAME + '_' + 'test' + '.tfrecord'
-  mkdir(FLAGS.save_dir)
+  save_path = temp_dir + "/" + cfgs.DATASET_NAME + '_' + 'test' + '.tfrecord'
 
   # writer_options = tf.python_io.TFRecordOptions(tf.python_io.TFRecordCompressionType.ZLIB)
   # writer = tf.python_io.TFRecordWriter(path=save_path, options=writer_options)
@@ -212,12 +209,100 @@ def convert_pascal_to_test_tfrecord():
       view_bar('Conversion progress', count + 1, len(xmls))
 
   print('\nConversion is completed!')
+  return save_path
 
+def convert_pascal_to_tfrecord_from_list(image_list, xml_list, save_name="test"):
+  # save_path = FLAGS.save_dir + cfgs.DATASET_NAME + '_' + "temporary" + "_" + save_name + '.tfrecord'
+  # mkdir(FLAGS.save_dir)
+
+  temp_dir = tempfile.mkdtemp()
+  if not os.path.isdir(temp_dir):
+    mkdir(temp_dir)
+  save_path = temp_dir + "/" + cfgs.DATASET_NAME + '_' + "temporary" + "_" + save_name + '.tfrecord'
+
+  writer = tf.python_io.TFRecordWriter(path=save_path)
+
+  print('{} in train...'.format(len(xml_list)))
+
+  for count, xml in enumerate(xml_list):
+    # to avoid path error in different development platform
+    xml = xml.replace('\\', '/')
+
+    img_name = xml.split('/')[-1].split('.')[0] + FLAGS.img_format
+    img_path = [img for img in image_list if img_name in img][0]
+
+    if not os.path.exists(img_path):
+      print('{} is not exist!'.format(img_path))
+      continue
+
+    if os.path.isfile(xml):
+
+      img_height, img_width, gtbox_label = read_xml_gtbox_and_label(xml)
+      img = read_image(img_path)
+
+      feature = tf.train.Features(feature={
+          # maybe do not need encode() in linux
+          'img_name': _bytes_feature(img_name),
+          'img_height': _int64_feature(img_height),
+          'img_width': _int64_feature(img_width),
+          'img': _bytes_feature(img.tostring()),
+          'gtboxes_and_label': _bytes_feature(gtbox_label.tostring()),
+          'num_objects': _int64_feature(gtbox_label.shape[0])
+      })
+
+      example = tf.train.Example(features=feature)
+
+      writer.write(example.SerializeToString())
+
+      view_bar('Conversion progress', count + 1, len(xml_list))
+
+  print('\nConversion is completed!')
+  return save_path
+
+def convert_label_list(lable_list, save_name="label"):
+  temp_dir = tempfile.mkdtemp()
+  if not os.path.isdir(temp_dir):
+    mkdir(temp_dir)
+  save_path = temp_dir + "/" + cfgs.DATASET_NAME + '_' + "temporary" + "_" + save_name + '.tfrecord'
+
+  writer = tf.python_io.TFRecordWriter(path=save_path)
+  print('{} in train...'.format(len(lable_list)))
+
+  for count, xml in enumerate(lable_list):
+    # to avoid path error in different development platform
+    xml = xml.replace('\\', '/')
+    img_name = xml.split('/')[-1].split('.')[0] + FLAGS.img_format
+
+    if os.path.isfile(xml):
+      img_height, img_width, gtbox_label = read_xml_gtbox_and_label(xml)
+      feature = tf.train.Features(feature={
+          # maybe do not need encode() in linux
+          'img_name': _bytes_feature(img_name),
+          'img_height': _int64_feature(img_height),
+          'img_width': _int64_feature(img_width),
+          # 'img': _bytes_feature(img.tostring()),
+          'gtboxes_and_label': _bytes_feature(gtbox_label.tostring()),
+          'num_objects': _int64_feature(gtbox_label.shape[0])
+      })
+      example = tf.train.Example(features=feature)
+      writer.write(example.SerializeToString())
+      view_bar('Conversion progress', count + 1, len(lable_list))
+
+  print('\nConversion is completed!')
+  return save_path
 
 if __name__ == '__main__':
   # xml_path = '../data/dataset/VOCdevkit/VOC2007/Annotations/000005.xml'
   # read_xml_gtbox_and_label(xml_path)
-  convert_pascal_to_tfrecord()
+  # convert_pascal_to_tfrecord()
   # convert_pascal_to_test_tfrecord()
+
+  xml_dir = cfgs.ROOT_PATH + f"/data/increment_data/test_data/Annotations"
+
+  # 传入jpeg和xml的地址
+  xmls = [os.path.join(xml_dir, xml_name) for xml_name in os.listdir(xml_dir)]
+
+  convert_label_list(xmls)
+
   # lis=os.listdir('../layer/JPEGImages/')
   # print(lis)

@@ -1,192 +1,741 @@
-# -*- coding:utf-8 -*-
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+from __future__ import absolute_import, division, print_function
 
-from __future__ import absolute_import
-from __future__ import print_function
-from __future__ import division
-
-import os, sys
-import tensorflow as tf
-import time
-import cv2
-import pickle
-import numpy as np
-sys.path.append("../")
-
-from data.io.image_preprocess import short_side_resize_for_inference_data
-from libs.configs import cfgs
-from libs.networks import build_whole_network
-from libs.val_libs import voc_eval
-from libs.box_utils import draw_box_in_img
 import argparse
-from help_utils import tools
+import os
+import pickle
+import sys
+import time
+
+import numpy as np
+import tensorflow as tf
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
+from data.io.read_tfrecord import next_batch
+from help_utils.tools import *
+from libs.fast_rcnn import build_fast_rcnn
+from libs.label_name_dict.label_dict import *
+from libs.networks.network_factory import get_flags_byname, get_network_byname
+from libs.rpn import build_rpn
+from tools import restore_model
+from data.io.convert_to_tfrecord import convert_pascal_to_test_tfrecord
+
+FLAGS = get_flags_byname(cfgs.NET_NAME)
 
 
-def eval_with_plac(det_net, real_test_imgname_list, img_root, draw_imgs=False):
+def eval_dict_convert(args):
+  with tf.Graph().as_default():
 
-    # 1. preprocess img
-    img_plac = tf.placeholder(dtype=tf.uint8, shape=[None, None, 3])  # is RGB. not BGR
-    img_batch = tf.cast(img_plac, tf.float32)
+    img_name_batch, img_batch, gtboxes_and_label_batch, num_objects_batch, data_num = \
+        next_batch(dataset_name=cfgs.DATASET_NAME,
+                   batch_size=cfgs.BATCH_SIZE,
+                   shortside_len=cfgs.SHORT_SIDE_LEN,
+                   is_training=False)
 
-    img_batch = short_side_resize_for_inference_data(img_tensor=img_batch,
-                                                     target_shortside_len=cfgs.IMG_SHORT_SIDE_LEN,
-                                                     length_limitation=cfgs.IMG_MAX_LENGTH)
-    img_batch = img_batch - tf.constant(cfgs.PIXEL_MEAN)
-    img_batch = tf.expand_dims(img_batch, axis=0)
+    # ***********************************************************************************************
+    # *                                         share net                                           *
+    # ***********************************************************************************************
+    _, share_net = get_network_byname(net_name=cfgs.NET_NAME,
+                                      inputs=img_batch,
+                                      num_classes=None,
+                                      is_training=True,
+                                      output_stride=None,
+                                      global_pool=False,
+                                      spatial_squeeze=False)
 
-    detection_boxes, detection_scores, detection_category = det_net.build_whole_detection_network(
-        input_img_batch=img_batch,
-        gtboxes_batch=None)
+    # ***********************************************************************************************
+    # *                                            RPN                                              *
+    # ***********************************************************************************************
+    rpn = build_rpn.RPN(net_name=cfgs.NET_NAME,
+                        inputs=img_batch,
+                        gtboxes_and_label=None,
+                        is_training=False,
+                        share_head=True,
+                        share_net=share_net,
+                        stride=cfgs.STRIDE,
+                        anchor_ratios=cfgs.ANCHOR_RATIOS,
+                        anchor_scales=cfgs.ANCHOR_SCALES,
+                        scale_factors=cfgs.SCALE_FACTORS,
+                        base_anchor_size_list=cfgs.BASE_ANCHOR_SIZE_LIST,  # P2, P3, P4, P5, P6
+                        level=cfgs.LEVEL,
+                        top_k_nms=cfgs.RPN_TOP_K_NMS,
+                        rpn_nms_iou_threshold=cfgs.RPN_NMS_IOU_THRESHOLD,
+                        max_proposals_num=cfgs.MAX_PROPOSAL_NUM,
+                        rpn_iou_positive_threshold=cfgs.RPN_IOU_POSITIVE_THRESHOLD,
+                        rpn_iou_negative_threshold=cfgs.RPN_IOU_NEGATIVE_THRESHOLD,
+                        rpn_mini_batch_size=cfgs.RPN_MINIBATCH_SIZE,
+                        rpn_positives_ratio=cfgs.RPN_POSITIVE_RATE,
+                        remove_outside_anchors=False,  # whether remove anchors outside
+                        rpn_weight_decay=cfgs.WEIGHT_DECAY[cfgs.NET_NAME])
 
+    # rpn predict proposals
+    rpn_proposals_boxes, rpn_proposals_scores = rpn.rpn_proposals()  # rpn_score shape: [300, ]
+
+    # ***********************************************************************************************
+    # *                                         Fast RCNN                                           *
+    # ***********************************************************************************************
+    fast_rcnn = build_fast_rcnn.FastRCNN(img_batch=img_batch,
+                                         feature_pyramid=rpn.feature_pyramid,
+                                         rpn_proposals_boxes=rpn_proposals_boxes,
+                                         rpn_proposals_scores=rpn_proposals_scores,
+                                         img_shape=tf.shape(img_batch),
+                                         roi_size=cfgs.ROI_SIZE,
+                                         scale_factors=cfgs.SCALE_FACTORS,
+                                         roi_pool_kernel_size=cfgs.ROI_POOL_KERNEL_SIZE,
+                                         gtboxes_and_label=None,
+                                         fast_rcnn_nms_iou_threshold=cfgs.FAST_RCNN_NMS_IOU_THRESHOLD,
+                                         fast_rcnn_maximum_boxes_per_img=100,
+                                         fast_rcnn_nms_max_boxes_per_class=cfgs.FAST_RCNN_NMS_MAX_BOXES_PER_CLASS,
+                                         show_detections_score_threshold=cfgs.FINAL_SCORE_THRESHOLD,  # show detections which score >= 0.6
+                                         num_classes=cfgs.CLASS_NUM,
+                                         fast_rcnn_minibatch_size=cfgs.FAST_RCNN_MINIBATCH_SIZE,
+                                         fast_rcnn_positives_ratio=cfgs.FAST_RCNN_POSITIVE_RATE,
+                                         fast_rcnn_positives_iou_threshold=cfgs.FAST_RCNN_IOU_POSITIVE_THRESHOLD,
+                                         use_dropout=False,
+                                         weight_decay=cfgs.WEIGHT_DECAY[cfgs.NET_NAME],
+                                         is_training=False,
+                                         level=cfgs.LEVEL)
+
+    fast_rcnn_decode_boxes, fast_rcnn_score, num_of_objects, detection_category = \
+        fast_rcnn.fast_rcnn_predict()
+
+    # train
     init_op = tf.group(
         tf.global_variables_initializer(),
         tf.local_variables_initializer()
     )
 
-    restorer, restore_ckpt = det_net.get_restorer()
+    restorer, restore_ckpt = restore_model.get_restorer(checkpoint_path=args.weights)
 
     config = tf.ConfigProto()
+    # config.gpu_options.per_process_gpu_memory_fraction = 0.5
     config.gpu_options.allow_growth = True
-
     with tf.Session(config=config) as sess:
-        sess.run(init_op)
-        if not restorer is None:
-            restorer.restore(sess, restore_ckpt)
-            print('restore model')
+      sess.run(init_op)
+      if not restorer is None:
+        restorer.restore(sess, restore_ckpt)
+        print('restore model')
 
-        all_boxes = []
-        for i, a_img_name in enumerate(real_test_imgname_list):
+      coord = tf.train.Coordinator()
+      threads = tf.train.start_queue_runners(sess, coord)
 
-            raw_img = cv2.imread(os.path.join(img_root, a_img_name))
-            raw_h, raw_w = raw_img.shape[0], raw_img.shape[1]
+      gtbox_dict = {}
+      predict_dict = {}
 
-            start = time.time()
-            resized_img, detected_boxes, detected_scores, detected_categories = \
-                sess.run(
-                    [img_batch, detection_boxes, detection_scores, detection_category],
-                    feed_dict={img_plac: raw_img[:, :, ::-1]}  # cv is BGR. But need RGB
-                )
-            end = time.time()
-            # print("{} cost time : {} ".format(img_name, (end - start)))
-            if draw_imgs:
-                show_indices = detected_scores >= cfgs.SHOW_SCORE_THRSHOLD
-                show_scores = detected_scores[show_indices]
-                show_boxes = detected_boxes[show_indices]
-                show_categories = detected_categories[show_indices]
-                final_detections = draw_box_in_img.draw_boxes_with_label_and_scores(np.squeeze(resized_img, 0),
-                                                                                    boxes=show_boxes,
-                                                                                    labels=show_categories,
-                                                                                    scores=show_scores)
-                if not os.path.exists(cfgs.TEST_SAVE_PATH):
-                    os.makedirs(cfgs.TEST_SAVE_PATH)
+      for i in range(args.img_num):
+        start = time.time()
 
-                cv2.imwrite(cfgs.TEST_SAVE_PATH + '/' + a_img_name + '.jpg',
-                            final_detections[:, :, ::-1])
+        _img_name_batch, _img_batch, _gtboxes_and_label_batch, _fast_rcnn_decode_boxes, \
+            _fast_rcnn_score, _detection_category \
+            = sess.run([img_name_batch, img_batch, gtboxes_and_label_batch, fast_rcnn_decode_boxes,
+                        fast_rcnn_score, detection_category])
+        end = time.time()
 
-            xmin, ymin, xmax, ymax = detected_boxes[:, 0], detected_boxes[:, 1], \
-                                     detected_boxes[:, 2], detected_boxes[:, 3]
+        # gtboxes convert dict
+        gtbox_dict[str(_img_name_batch[0])] = []
+        predict_dict[str(_img_name_batch[0])] = []
 
-            resized_h, resized_w = resized_img.shape[1], resized_img.shape[2]
+        for j, box in enumerate(_gtboxes_and_label_batch[0]):
+          bbox_dict = {}
+          bbox_dict['bbox'] = np.array(_gtboxes_and_label_batch[0][j, :-1], np.float64)
+          bbox_dict['name'] = LABEl_NAME_MAP[int(_gtboxes_and_label_batch[0][j, -1])]
+          gtbox_dict[str(_img_name_batch[0])].append(bbox_dict)
 
-            xmin = xmin * raw_w / resized_w
-            xmax = xmax * raw_w / resized_w
+        for label in NAME_LABEL_MAP.keys():
+          if label == 'back_ground':
+            continue
+          else:
+            temp_dict = {}
+            temp_dict['name'] = label
 
-            ymin = ymin * raw_h / resized_h
-            ymax = ymax * raw_h / resized_h
+            ind = np.where(_detection_category == NAME_LABEL_MAP[label])[0]
+            temp_boxes = _fast_rcnn_decode_boxes[ind]
+            temp_score = np.reshape(_fast_rcnn_score[ind], [-1, 1])
+            temp_dict['bbox'] = np.array(np.concatenate(
+                [temp_boxes, temp_score], axis=1), np.float64)
+            predict_dict[str(_img_name_batch[0])].append(temp_dict)
 
-            boxes = np.transpose(np.stack([xmin, ymin, xmax, ymax]))
-            dets = np.hstack((detected_categories.reshape(-1, 1),
-                              detected_scores.reshape(-1, 1),
-                              boxes))
-            all_boxes.append(dets)
+        view_bar('{} image cost {}s'.format(
+            str(_img_name_batch[0]), (end - start)), i + 1, args.img_num)
 
-            tools.view_bar('{} image cost {}s'.format(a_img_name, (end - start)), i + 1, len(real_test_imgname_list))
+      fw1 = open('gtboxes_dict.pkl', 'wb')
+      fw2 = open('predict_dict.pkl', 'wb')
+      pickle.dump(gtbox_dict, fw1)
+      pickle.dump(predict_dict, fw2)
+      fw1.close()
+      fw2.close()
+      coord.request_stop()
+      coord.join(threads)
 
-        # save_dir = os.path.join(cfgs.EVALUATE_DIR, cfgs.VERSION)
-        # if not os.path.exists(save_dir):
-        #     os.makedirs(save_dir)
-        # fw1 = open(os.path.join(save_dir, 'detections.pkl'), 'wb')
-        # pickle.dump(all_boxes, fw1)
-        return all_boxes
+# def fpn_eval_dict_convert(data=None, checkpoint_path=None):
+#   # data_dir must include dir "Annotations" and "JPEGImages"
+#   # xml_dir = os.path.join(data, "Annotations")
+#   # image_dir = os.path.join(data, "JPEGImages")
+#
+#   # convert_pascal_to_test_tfrecord(xml_dir, image_dir)
+#
+#   with tf.Graph().as_default():
+#
+#     with tf.name_scope('get_batch'):
+#         img_name_batch, img_batch, gtboxes_and_label_batch, num_objects_batch, data_num = \
+#             next_batch(dataset_name=cfgs.DATASET_NAME,
+#                        batch_size=cfgs.BATCH_SIZE,
+#                        shortside_len=cfgs.SHORT_SIDE_LEN,
+#                        is_training=False)
+#
+#     # ***********************************************************************************************
+#     # *                                         share net                                           *
+#     # ***********************************************************************************************
+#
+#     _, share_net = get_network_byname(net_name=cfgs.NET_NAME,
+#                                       inputs=img_batch,
+#                                       num_classes=None,
+#                                       is_training=True,
+#                                       output_stride=None,
+#                                       global_pool=False,
+#                                       spatial_squeeze=False)
+#
+#     # ***********************************************************************************************
+#     # *                                            RPN                                              *
+#     # ***********************************************************************************************
+#
+#     rpn = build_rpn.RPN(net_name=cfgs.NET_NAME,
+#                         inputs=img_batch,
+#                         gtboxes_and_label=None,
+#                         is_training=False,
+#                         share_head=True,
+#                         share_net=share_net,
+#                         stride=cfgs.STRIDE,
+#                         anchor_ratios=cfgs.ANCHOR_RATIOS,
+#                         anchor_scales=cfgs.ANCHOR_SCALES,
+#                         scale_factors=cfgs.SCALE_FACTORS,
+#                         base_anchor_size_list=cfgs.BASE_ANCHOR_SIZE_LIST,  # P2, P3, P4, P5, P6
+#                         level=cfgs.LEVEL,
+#                         top_k_nms=cfgs.RPN_TOP_K_NMS,
+#                         rpn_nms_iou_threshold=cfgs.RPN_NMS_IOU_THRESHOLD,
+#                         max_proposals_num=cfgs.MAX_PROPOSAL_NUM,
+#                         rpn_iou_positive_threshold=cfgs.RPN_IOU_POSITIVE_THRESHOLD,
+#                         rpn_iou_negative_threshold=cfgs.RPN_IOU_NEGATIVE_THRESHOLD,
+#                         rpn_mini_batch_size=cfgs.RPN_MINIBATCH_SIZE,
+#                         rpn_positives_ratio=cfgs.RPN_POSITIVE_RATE,
+#                         remove_outside_anchors=False,  # whether remove anchors outside
+#                         rpn_weight_decay=cfgs.WEIGHT_DECAY[cfgs.NET_NAME])
+#
+#     # rpn predict proposals
+#     rpn_proposals_boxes, rpn_proposals_scores = rpn.rpn_proposals()  # rpn_score shape: [300, ]
+#
+#     # ***********************************************************************************************
+#     # *                                         Fast RCNN                                           *
+#     # ***********************************************************************************************
+#     fast_rcnn = build_fast_rcnn.FastRCNN(img_batch=img_batch,
+#                                          feature_pyramid=rpn.feature_pyramid,
+#                                          rpn_proposals_boxes=rpn_proposals_boxes,
+#                                          rpn_proposals_scores=rpn_proposals_scores,
+#                                          img_shape=tf.shape(img_batch),
+#                                          roi_size=cfgs.ROI_SIZE,
+#                                          scale_factors=cfgs.SCALE_FACTORS,
+#                                          roi_pool_kernel_size=cfgs.ROI_POOL_KERNEL_SIZE,
+#                                          gtboxes_and_label=None,
+#                                          fast_rcnn_nms_iou_threshold=cfgs.FAST_RCNN_NMS_IOU_THRESHOLD,
+#                                          fast_rcnn_maximum_boxes_per_img=100,
+#                                          fast_rcnn_nms_max_boxes_per_class=cfgs.FAST_RCNN_NMS_MAX_BOXES_PER_CLASS,
+#                                          show_detections_score_threshold=cfgs.FINAL_SCORE_THRESHOLD,  # show detections which score >= 0.6
+#                                          num_classes=cfgs.CLASS_NUM,
+#                                          fast_rcnn_minibatch_size=cfgs.FAST_RCNN_MINIBATCH_SIZE,
+#                                          fast_rcnn_positives_ratio=cfgs.FAST_RCNN_POSITIVE_RATE,
+#                                          fast_rcnn_positives_iou_threshold=cfgs.FAST_RCNN_IOU_POSITIVE_THRESHOLD,
+#                                          use_dropout=False,
+#                                          weight_decay=cfgs.WEIGHT_DECAY[cfgs.NET_NAME],
+#                                          is_training=False,
+#                                          level=cfgs.LEVEL)
+#
+#     fast_rcnn_decode_boxes, fast_rcnn_score, num_of_objects, detection_category = \
+#         fast_rcnn.fast_rcnn_predict()
+#
+#     # train
+#     init_op = tf.group(
+#         tf.global_variables_initializer(),
+#         tf.local_variables_initializer()
+#     )
+#
+#     if not checkpoint_path:
+#         checkpoint_path = tf.train.latest_checkpoint(
+#             os.path.join('output/{}'.format(cfgs.DATASET_NAME), FLAGS.trained_checkpoint, cfgs.VERSION))
+#         print(f'When weight path is not specified, use the latest weight from {checkpoint_path}')
+#
+#     restorer, restore_ckpt = restore_model.get_restorer(checkpoint_path=checkpoint_path)
+#
+#     config = tf.ConfigProto()
+#     # config.gpu_options.per_process_gpu_memory_fraction = 0.5
+#     config.gpu_options.allow_growth = True
+#     with tf.Session(config=config) as sess:
+#       sess.run(init_op)
+#       if not restorer is None:
+#         restorer.restore(sess, restore_ckpt)
+#         print('restore model')
+#
+#       coord = tf.train.Coordinator()
+#       threads = tf.train.start_queue_runners(sess, coord)
+#
+#       gtbox_dict = {}
+#       predict_dict = {}
+#
+#       for i in range(data_num):
+#         start = time.time()
+#
+#         _img_name_batch, _img_batch, _gtboxes_and_label_batch, _fast_rcnn_decode_boxes, \
+#             _fast_rcnn_score, _detection_category \
+#             = sess.run([img_name_batch, img_batch, gtboxes_and_label_batch, fast_rcnn_decode_boxes,
+#                         fast_rcnn_score, detection_category])
+#         end = time.time()
+#
+#         # gtboxes convert dict
+#         gtbox_dict[str(_img_name_batch[0])] = []
+#         predict_dict[str(_img_name_batch[0])] = []
+#
+#         for j, box in enumerate(_gtboxes_and_label_batch[0]):
+#           bbox_dict = {}
+#           bbox_dict['bbox'] = np.array(_gtboxes_and_label_batch[0][j, :-1], np.float64)
+#           bbox_dict['name'] = LABEl_NAME_MAP[int(_gtboxes_and_label_batch[0][j, -1])]
+#           gtbox_dict[str(_img_name_batch[0])].append(bbox_dict)
+#
+#         for label in NAME_LABEL_MAP.keys():
+#           if label == 'back_ground':
+#             continue
+#           else:
+#             temp_dict = {}
+#             temp_dict['name'] = label
+#
+#             ind = np.where(_detection_category == NAME_LABEL_MAP[label])[0]
+#             temp_boxes = _fast_rcnn_decode_boxes[ind]
+#             temp_score = np.reshape(_fast_rcnn_score[ind], [-1, 1])
+#             temp_dict['bbox'] = np.array(np.concatenate(
+#                 [temp_boxes, temp_score], axis=1), np.float64)
+#             predict_dict[str(_img_name_batch[0])].append(temp_dict)
+#
+#         view_bar('{} image cost {}s'.format(
+#             str(_img_name_batch[0]), (end - start)), i + 1, data_num)
+#
+#       fw1 = open('gtboxes_dict.pkl', 'wb')
+#       fw2 = open('predict_dict.pkl', 'wb')
+#       pickle.dump(gtbox_dict, fw1)
+#       pickle.dump(predict_dict, fw2)
+#       fw1.close()
+#       fw2.close()
+#       coord.request_stop()
+#       coord.join(threads)
 
 
-def eval(num_imgs, eval_dir, annotation_dir, showbox):
+def fpn_eval_dict_convert(data=None,
+                          checkpoint_path=None,
+                          img_name_batch=None,
+                          gtboxes_and_label_batch=None,
+                          num_objects_batch=None,
+                          data_num=None,
+                          graph=None
+                          ):
 
-    # with open('/home/yjr/DataSet/VOC/VOC_test/VOC2007/ImageSets/Main/aeroplane_test.txt') as f:
-    #     all_lines = f.readlines()
-    # test_imgname_list = [a_line.split()[0].strip() for a_line in all_lines]
+  with graph.as_default():
+    img_batch = data
 
-    test_imgname_list = [item for item in os.listdir(eval_dir)
-                              if item.endswith(('.jpg', 'jpeg', '.png', '.tif', '.tiff'))]
-    if num_imgs == np.inf:
-        real_test_imgname_list = test_imgname_list
+    # ***********************************************************************************************
+    # *                                         share net                                           *
+    # ***********************************************************************************************
+    _, share_net = get_network_byname(net_name=cfgs.NET_NAME,
+                                      inputs=img_batch,
+                                      num_classes=None,
+                                      is_training=True,
+                                      output_stride=None,
+                                      global_pool=False,
+                                      spatial_squeeze=False)
+
+    # ***********************************************************************************************
+    # *                                            RPN                                              *
+    # ***********************************************************************************************
+    rpn = build_rpn.RPN(net_name=cfgs.NET_NAME,
+                        inputs=img_batch,
+                        gtboxes_and_label=None,
+                        is_training=False,
+                        share_head=True,
+                        share_net=share_net,
+                        stride=cfgs.STRIDE,
+                        anchor_ratios=cfgs.ANCHOR_RATIOS,
+                        anchor_scales=cfgs.ANCHOR_SCALES,
+                        scale_factors=cfgs.SCALE_FACTORS,
+                        base_anchor_size_list=cfgs.BASE_ANCHOR_SIZE_LIST,  # P2, P3, P4, P5, P6
+                        level=cfgs.LEVEL,
+                        top_k_nms=cfgs.RPN_TOP_K_NMS,
+                        rpn_nms_iou_threshold=cfgs.RPN_NMS_IOU_THRESHOLD,
+                        max_proposals_num=cfgs.MAX_PROPOSAL_NUM,
+                        rpn_iou_positive_threshold=cfgs.RPN_IOU_POSITIVE_THRESHOLD,
+                        rpn_iou_negative_threshold=cfgs.RPN_IOU_NEGATIVE_THRESHOLD,
+                        rpn_mini_batch_size=cfgs.RPN_MINIBATCH_SIZE,
+                        rpn_positives_ratio=cfgs.RPN_POSITIVE_RATE,
+                        remove_outside_anchors=False,  # whether remove anchors outside
+                        rpn_weight_decay=cfgs.WEIGHT_DECAY[cfgs.NET_NAME])
+
+    # rpn predict proposals
+    rpn_proposals_boxes, rpn_proposals_scores = rpn.rpn_proposals()  # rpn_score shape: [300, ]
+
+    # ***********************************************************************************************
+    # *                                         Fast RCNN                                           *
+    # ***********************************************************************************************
+    fast_rcnn = build_fast_rcnn.FastRCNN(img_batch=img_batch,
+                                         feature_pyramid=rpn.feature_pyramid,
+                                         rpn_proposals_boxes=rpn_proposals_boxes,
+                                         rpn_proposals_scores=rpn_proposals_scores,
+                                         img_shape=tf.shape(img_batch),
+                                         roi_size=cfgs.ROI_SIZE,
+                                         scale_factors=cfgs.SCALE_FACTORS,
+                                         roi_pool_kernel_size=cfgs.ROI_POOL_KERNEL_SIZE,
+                                         gtboxes_and_label=None,
+                                         fast_rcnn_nms_iou_threshold=cfgs.FAST_RCNN_NMS_IOU_THRESHOLD,
+                                         fast_rcnn_maximum_boxes_per_img=100,
+                                         fast_rcnn_nms_max_boxes_per_class=cfgs.FAST_RCNN_NMS_MAX_BOXES_PER_CLASS,
+                                         show_detections_score_threshold=cfgs.FINAL_SCORE_THRESHOLD,  # show detections which score >= 0.6
+                                         num_classes=cfgs.CLASS_NUM,
+                                         fast_rcnn_minibatch_size=cfgs.FAST_RCNN_MINIBATCH_SIZE,
+                                         fast_rcnn_positives_ratio=cfgs.FAST_RCNN_POSITIVE_RATE,
+                                         fast_rcnn_positives_iou_threshold=cfgs.FAST_RCNN_IOU_POSITIVE_THRESHOLD,
+                                         use_dropout=False,
+                                         weight_decay=cfgs.WEIGHT_DECAY[cfgs.NET_NAME],
+                                         is_training=False,
+                                         level=cfgs.LEVEL)
+
+    fast_rcnn_decode_boxes, fast_rcnn_score, num_of_objects, detection_category = \
+        fast_rcnn.fast_rcnn_predict()
+
+    # train
+    init_op = tf.group(
+        tf.global_variables_initializer(),
+        tf.local_variables_initializer()
+    )
+
+    if not checkpoint_path:
+        checkpoint_path = tf.train.latest_checkpoint(
+            os.path.join('output/{}'.format(cfgs.DATASET_NAME), FLAGS.trained_checkpoint, cfgs.VERSION))
+        print(f'When weight path is not specified, use the latest weight from {checkpoint_path}')
+
+    restorer, restore_ckpt = restore_model.get_restorer(checkpoint_path=checkpoint_path)
+
+    config = tf.ConfigProto()
+    # config.gpu_options.per_process_gpu_memory_fraction = 0.5
+    config.gpu_options.allow_growth = True
+    with tf.Session(config=config) as sess:
+      sess.run(init_op)
+      if not restorer is None:
+        restorer.restore(sess, restore_ckpt)
+        print('restore model')
+
+      coord = tf.train.Coordinator()
+      threads = tf.train.start_queue_runners(sess, coord)
+
+      gtbox_dict = {}
+      predict_dict = {}
+
+      for i in range(data_num):
+        start = time.time()
+
+        _img_name_batch, _img_batch, _gtboxes_and_label_batch, _fast_rcnn_decode_boxes, \
+            _fast_rcnn_score, _detection_category \
+            = sess.run([img_name_batch, img_batch, gtboxes_and_label_batch, fast_rcnn_decode_boxes,
+                        fast_rcnn_score, detection_category])
+        end = time.time()
+
+        # gtboxes convert dict
+        gtbox_dict[str(_img_name_batch[0])] = []
+        predict_dict[str(_img_name_batch[0])] = []
+
+        for j, box in enumerate(_gtboxes_and_label_batch[0]):
+          bbox_dict = {}
+          bbox_dict['bbox'] = np.array(_gtboxes_and_label_batch[0][j, :-1], np.float64)
+          bbox_dict['name'] = LABEl_NAME_MAP[int(_gtboxes_and_label_batch[0][j, -1])]
+          gtbox_dict[str(_img_name_batch[0])].append(bbox_dict)
+
+        for label in NAME_LABEL_MAP.keys():
+          if label == 'back_ground':
+            continue
+          else:
+            temp_dict = {}
+            temp_dict['name'] = label
+
+            ind = np.where(_detection_category == NAME_LABEL_MAP[label])[0]
+            temp_boxes = _fast_rcnn_decode_boxes[ind]
+            temp_score = np.reshape(_fast_rcnn_score[ind], [-1, 1])
+            temp_dict['bbox'] = np.array(np.concatenate(
+                [temp_boxes, temp_score], axis=1), np.float64)
+            predict_dict[str(_img_name_batch[0])].append(temp_dict)
+
+        view_bar('{} image cost {}s'.format(
+            str(_img_name_batch[0]), (end - start)), i + 1, data_num)
+
+      fw1 = open('gtboxes_dict.pkl', 'wb')
+      fw2 = open('predict_dict.pkl', 'wb')
+      pickle.dump(gtbox_dict, fw1)
+      pickle.dump(predict_dict, fw2)
+      fw1.close()
+      fw2.close()
+      coord.request_stop()
+      coord.join(threads)
+
+def voc_ap(rec, prec, use_07_metric=False):
+  """
+  average precision calculations
+  [precision integrated to recall]
+  :param rec: recall
+  :param prec: precision
+  :param use_07_metric: 2007 metric is 11-recall-point based AP
+  :return: average precision
+  """
+  if use_07_metric:
+    ap = 0.
+    for t in np.arange(0., 1.1, 0.1):
+      if np.sum(rec >= t) == 0:
+        p = 0
+      else:
+        p = np.max(prec[rec >= t])
+      ap += p / 11.
+  else:
+    # append sentinel values at both ends
+    mrec = np.concatenate(([0.], rec, [1.]))
+    mpre = np.concatenate(([0.], prec, [0.]))
+
+    # compute precision integration ladder
+    for i in range(mpre.size - 1, 0, -1):
+      mpre[i - 1] = np.maximum(mpre[i - 1], mpre[i])
+
+    # look for recall value changes
+    i = np.where(mrec[1:] != mrec[:-1])[0]
+
+    # sum (\delta recall) * prec
+    ap = np.sum((mrec[i + 1] - mrec[i]) * mpre[i + 1])
+  return ap
+
+
+def get_single_label_dict(predict_dict, gtboxes_dict, label):
+  rboxes = {}
+  gboxes = {}
+  rbox_images = predict_dict.keys()
+  #print("predict_dict:",predict_dict)
+  rbox_images=list(rbox_images)
+  #print("rbox_images:",rbox_images,type(rbox_images))
+
+  for i in range(len(rbox_images)):
+    rbox_image = rbox_images[i]
+    for pre_box in predict_dict[rbox_image]:
+      if pre_box['name'] == label and len(pre_box['bbox']) != 0:
+        rboxes[rbox_image] = [pre_box]
+
+        gboxes[rbox_image] = []
+
+        for gt_box in gtboxes_dict[rbox_image]:
+          if gt_box['name'] == label:
+            gboxes[rbox_image].append(gt_box)
+  return rboxes, gboxes
+
+
+def eval(rboxes, gboxes, iou_th, use_07_metric):
+  rbox_images = list(rboxes.keys())
+  fp = np.zeros(len(rbox_images))
+  tp = np.zeros(len(rbox_images))
+  box_num = 0
+
+  for i in range(len(rbox_images)):
+    rbox_image = rbox_images[i]
+    if len(rboxes[rbox_image][0]['bbox']) > 0:
+
+      rbox_lists = np.array(rboxes[rbox_image][0]['bbox'])
+      if len(gboxes[rbox_image]) > 0:
+        gbox_list = np.array([obj['bbox'] for obj in gboxes[rbox_image]])
+        box_num = box_num + len(gbox_list)
+        gbox_list = np.concatenate((gbox_list, np.zeros((np.shape(gbox_list)[0], 1))), axis=1)
+        confidence = rbox_lists[:, 4]
+        box_index = np.argsort(-confidence)
+
+        rbox_lists = rbox_lists[box_index, :]
+        for rbox_list in rbox_lists:
+
+          ixmin = np.maximum(gbox_list[:, 0], rbox_list[0])
+          iymin = np.maximum(gbox_list[:, 1], rbox_list[1])
+          ixmax = np.minimum(gbox_list[:, 2], rbox_list[2])
+          iymax = np.minimum(gbox_list[:, 3], rbox_list[3])
+          iw = np.maximum(ixmax - ixmin + 1., 0.)
+          ih = np.maximum(iymax - iymin + 1., 0.)
+          inters = iw * ih
+
+          # union
+          uni = ((rbox_list[2] - rbox_list[0] + 1.) * (rbox_list[3] - rbox_list[1] + 1.) +
+                 (gbox_list[:, 2] - gbox_list[:, 0] + 1.) *
+                 (gbox_list[:, 3] - gbox_list[:, 1] + 1.) - inters)
+          overlaps = inters / uni
+          ovmax = np.max(overlaps)
+          jmax = np.argmax(overlaps)
+          if ovmax > iou_th:
+            if gbox_list[jmax, -1] == 0:
+              tp[i] += 1
+              gbox_list[jmax, -1] = 1
+            else:
+              fp[i] += 1
+          else:
+            fp[i] += 1
+
+      else:
+        fp[i] += len(rboxes[rbox_image][0]['bbox'])
     else:
-        real_test_imgname_list = test_imgname_list[: num_imgs]
+      continue
+  rec = np.zeros(len(rbox_images))
+  prec = np.zeros(len(rbox_images))
+  if box_num == 0:
+    for i in range(len(fp)):
+      if fp[i] != 0:
+        prec[i] = 0
+      else:
+        prec[i] = 1
 
-    faster_rcnn = build_whole_network.DetectionNetwork(base_network_name=cfgs.NET_NAME,
-                                                       is_training=False)
-    all_boxes = eval_with_plac(det_net=faster_rcnn, real_test_imgname_list=real_test_imgname_list,
-                   img_root=eval_dir,
-                   draw_imgs=showbox)
+  else:
 
-    # save_dir = os.path.join(cfgs.EVALUATE_DIR, cfgs.VERSION)
-    # if not os.path.exists(save_dir):
-    #     os.makedirs(save_dir)
-    # with open(os.path.join(save_dir, 'detections.pkl'), 'rb') as f:
-    #     all_boxes = pickle.load(f)
-    #
-    #     print(len(all_boxes))
+    fp = np.cumsum(fp)
+    tp = np.cumsum(tp)
 
-    voc_eval.voc_evaluate_detections(all_boxes=all_boxes,
-                                     test_annotation_path=annotation_dir,
-                                     test_imgid_list=real_test_imgname_list)
+    prec = tp / np.maximum(tp + fp, np.finfo(np.float64).eps)
+    rec = tp / box_num
+
+  ap = voc_ap(rec, prec, use_07_metric)
+
+  return rec, prec, ap, box_num
+
 
 def parse_args():
+  """
+  Parse input arguments
+  """
+  parser = argparse.ArgumentParser(description='Evaluate a trained FPN model')
+  parser.add_argument('--src_folder', dest='src_folder',
+                      help='images path',
+                      default='{}/tools/inference_image'.format(cfgs.ROOT_PATH), type=str)
+  parser.add_argument('--des_folder', dest='des_folder',
+                      help='output path',
+                      default='{}/tools/image_out'.format(cfgs.ROOT_PATH), type=str)
+  parser.add_argument('--weights', dest='weights',
+                      help='model path',
+                      default='{}/output/layer/res101_trained_weights/v1_layer/layer_49999model.ckpt'.format(cfgs.ROOT_PATH),
+                      type=str)
+  parser.add_argument('--img_num', dest='img_num',
+                      help='image numbers',
+                      default=60, type=int)
 
-    parser = argparse.ArgumentParser('evaluate the result with Pascal2007 stdand')
+  args = parser.parse_args()
+  return args
 
-    parser.add_argument('--eval_imgs', dest='eval_imgs',
-                        help='evaluate imgs dir ',
-                        default='/data/VOC/VOC_test/VOC2007/JPEGImages', type=str)
-    parser.add_argument('--annotation_dir', dest='test_annotation_dir',
-                        help='the dir save annotations',
-                        default='/data/VOC/VOC_test/VOC2007/Annotations', type=str)
-    parser.add_argument('--showbox', dest='showbox',
-                        help='whether show detecion results when evaluation',
-                        default=False, type=bool)
-    parser.add_argument('--GPU', dest='GPU',
-                        help='gpu id',
-                        default='0', type=str)
-    parser.add_argument('--eval_num', dest='eval_num',
-                        help='the num of eval imgs',
-                        default=np.inf, type=int)
-    args = parser.parse_args()
-    return args
+def fpn_eval(data=None,
+             checkpoint_path=None,
+             img_name_batch=None,
+             gtboxes_and_label_batch=None,
+             num_objects_batch=None,
+             data_num=None,
+             graph=None):
 
+    fpn_eval_dict_convert(data=data,
+                          checkpoint_path=checkpoint_path,
+                          img_name_batch=img_name_batch,
+                          gtboxes_and_label_batch=gtboxes_and_label_batch,
+                          num_objects_batch=num_objects_batch,
+                          data_num=data_num,
+                          graph=graph
+                          )
 
-if __name__ == '__main__':
+    fr1 = open('predict_dict.pkl', 'rb')
+    fr2 = open('gtboxes_dict.pkl', 'rb')
 
-    args = parse_args()
-    print(20*"--")
-    print(args)
-    print(20*"--")
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.GPU
-    eval(np.inf,  # use np.inf to test all the imgs. use 10 to test 10 imgs.
-         eval_dir=args.eval_imgs,
-         annotation_dir=args.test_annotation_dir,
-         showbox=args.showbox)
+    predict_dict = pickle.load(fr1)
+    gtboxes_dict = pickle.load(fr2)
 
+    R, P, AP, F, num = [], [], [], [], []
 
+    for label in NAME_LABEL_MAP.keys():
+        if label == 'back_ground':
+            continue
 
+        rboxes, gboxes = get_single_label_dict(predict_dict, gtboxes_dict, label)
+        # print('label',label)
+        rec, prec, ap, box_num = eval(rboxes, gboxes, 0.3, False)
+        # print("rec",rec)
+        # print("prec", prec)
+        recall = rec[-1]
+        precision = prec[-1]
+        F_measure = (2 * precision * recall) / (recall + precision)
+        print('\n{}\tR:{}\tP:{}\tap:{}\tF:{}'.format(label, recall, precision, ap, F_measure))
+        R.append(recall)
+        P.append(precision)
+        AP.append(ap)
+        F.append(F_measure)
+        num.append(box_num)
+    print("num:", num)
+    R = np.array(R)
+    P = np.array(P)
+    AP = np.array(AP)
+    F = np.array(F)
+    num = np.array(num)
+    weights = num / np.sum(num)
+    Recall = np.sum(R) / 2
+    Precision = np.sum(P) / 2
+    mAP = np.sum(AP) / 2
+    F_measure = np.sum(F) / 2
+    print('\n{}\tR:{}\tP:{}\tmAP:{}\tF:{}'.format('Final', Recall, Precision, mAP, F_measure))
 
+    fr1.close()
+    fr2.close()
 
+    return {
+        "recall": Recall, "precision": Precision, "f_measure": F_measure
+    }
 
+if __name__ == "__main__":
+  args = parse_args()
+  print('Called with args:')
+  print(args)
+  eval_dict_convert(args)
+  #
+  fr1 = open('predict_dict.pkl', 'rb')
+  fr2 = open('gtboxes_dict.pkl', 'rb')
 
+  predict_dict = pickle.load(fr1)
+  gtboxes_dict = pickle.load(fr2)
 
+  R, P, AP, F, num = [], [], [], [], []
 
+  for label in NAME_LABEL_MAP.keys():
+    if label == 'back_ground':
+      continue
 
+    rboxes, gboxes = get_single_label_dict(predict_dict, gtboxes_dict, label)
+    # print('label',label)
+    rec, prec, ap, box_num = eval(rboxes, gboxes, 0.3, False)
+    # print("rec",rec)
+    # print("prec", prec)
+    recall = rec[-1]
+    precision = prec[-1]
+    F_measure = (2*precision*recall)/(recall+precision)
+    print('\n{}\tR:{}\tP:{}\tap:{}\tF:{}'.format(label, recall, precision, ap, F_measure))
+    R.append(recall)
+    P.append(precision)
+    AP.append(ap)
+    F.append(F_measure)
+    num.append(box_num)
+  print("num:",num)
+  R = np.array(R)
+  P = np.array(P)
+  AP = np.array(AP)
+  F = np.array(F)
+  num = np.array(num)
+  weights = num / np.sum(num)
+  Recall = np.sum(R)/2
+  Precision = np.sum(P)/2
+  mAP = np.sum(AP)/2
+  F_measure = np.sum(F)/2
+  print('\n{}\tR:{}\tP:{}\tmAP:{}\tF:{}'.format('Final', Recall, Precision, mAP, F_measure))
 
-
-
-
-
-
+  fr1.close()
+  fr2.close()

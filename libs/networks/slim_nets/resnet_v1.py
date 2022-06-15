@@ -58,7 +58,7 @@ from __future__ import print_function
 
 import tensorflow as tf
 
-from libs.networks.slim_nets import resnet_utils
+from FPN_TensorFlow.libs.networks.slim_nets import resnet_utils
 
 
 resnet_arg_scope = resnet_utils.resnet_arg_scope

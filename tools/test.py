@@ -1,155 +1,327 @@
 # -*- coding:utf-8 -*-
+from __future__ import absolute_import, division, print_function
 
-from __future__ import absolute_import
-from __future__ import print_function
-from __future__ import division
-
-import os, sys
-import tensorflow as tf
-import time
-import cv2
 import argparse
+import os
+import sys
+import time
+
+import cv2
 import numpy as np
-sys.path.append("../")
+import tensorflow as tf
+from tqdm import tqdm
 
-from data.io.image_preprocess import short_side_resize_for_inference_data
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
+from data.io.read_tfrecord import next_batch
+from help_utils import help_utils
+from help_utils.tools import *
 from libs.configs import cfgs
-from libs.networks import build_whole_network
-from libs.box_utils import draw_box_in_img
-from help_utils import tools
+from libs.fast_rcnn import build_fast_rcnn
+from libs.networks.network_factory import get_network_byname, get_flags_byname
+from libs.rpn import build_rpn
+from tools import restore_model
 
-
-def detect(det_net, inference_save_path, real_test_imgname_list):
-
-    # 1. preprocess img
-    img_plac = tf.placeholder(dtype=tf.uint8, shape=[None, None, 3])  # is RGB. not GBR
-    img_batch = tf.cast(img_plac, tf.float32)
-    img_batch = short_side_resize_for_inference_data(img_tensor=img_batch,
-                                                     target_shortside_len=cfgs.IMG_SHORT_SIDE_LEN,
-                                                     length_limitation=cfgs.IMG_MAX_LENGTH)
-    img_batch = img_batch - tf.constant(cfgs.PIXEL_MEAN)
-    img_batch = tf.expand_dims(img_batch, axis=0) # [1, None, None, 3]
-
-    detection_boxes, detection_scores, detection_category = det_net.build_whole_detection_network(
-        input_img_batch=img_batch,
-        gtboxes_batch=None)
-
-    init_op = tf.group(
-        tf.global_variables_initializer(),
-        tf.local_variables_initializer()
-    )
-
-    restorer, restore_ckpt = det_net.get_restorer()
-
-    config = tf.ConfigProto()
-    config.gpu_options.allow_growth = True
-
-    with tf.Session(config=config) as sess:
-        sess.run(init_op)
-        if not restorer is None:
-            restorer.restore(sess, restore_ckpt)
-            print('restore model')
-
-        for i, a_img_name in enumerate(real_test_imgname_list):
-
-            raw_img = cv2.imread(a_img_name)
-            start = time.time()
-            resized_img, detected_boxes, detected_scores, detected_categories = \
-                sess.run(
-                    [img_batch, detection_boxes, detection_scores, detection_category],
-                    feed_dict={img_plac: raw_img}  
-                )
-            end = time.time()
-            # print("{} cost time : {} ".format(img_name, (end - start)))
-
-            raw_h, raw_w = raw_img.shape[0], raw_img.shape[1]
-
-            xmin, ymin, xmax, ymax = detected_boxes[:, 0], detected_boxes[:, 1], \
-                                     detected_boxes[:, 2], detected_boxes[:, 3]
-
-            resized_h, resized_w = resized_img.shape[1], resized_img.shape[2]
-
-            xmin = xmin * raw_w / resized_w
-            xmax = xmax * raw_w / resized_w
-
-            ymin = ymin * raw_h / resized_h
-            ymax = ymax * raw_h / resized_h
-
-            detected_boxes = np.transpose(np.stack([xmin, ymin, xmax, ymax]))
-
-            show_indices = detected_scores >= cfgs.SHOW_SCORE_THRSHOLD
-            show_scores = detected_scores[show_indices]
-            show_boxes = detected_boxes[show_indices]
-            show_categories = detected_categories[show_indices]
-            final_detections = draw_box_in_img.draw_boxes_with_label_and_scores(raw_img - np.array(cfgs.PIXEL_MEAN),
-                                                                                boxes=show_boxes,
-                                                                                labels=show_categories,
-                                                                                scores=show_scores)
-            nake_name = a_img_name.split('/')[-1]
-            # print (inference_save_path + '/' + nake_name)
-            cv2.imwrite(inference_save_path + '/' + nake_name,
-                        final_detections[:, :, ::-1])
-
-            tools.view_bar('{} image cost {}s'.format(a_img_name, (end - start)), i + 1, len(real_test_imgname_list))
-
-
-def test(test_dir, inference_save_path):
-
-    test_imgname_list = [os.path.join(test_dir, img_name) for img_name in os.listdir(test_dir)
-                                                          if img_name.endswith(('.jpg', '.png', '.jpeg', '.tif', '.tiff'))]
-    assert len(test_imgname_list) != 0, 'test_dir has no imgs there.' \
-                                        ' Note that, we only support img format of (.jpg, .png, and .tiff) '
-
-    faster_rcnn = build_whole_network.DetectionNetwork(base_network_name=cfgs.NET_NAME,
-                                                       is_training=False)
-    detect(det_net=faster_rcnn, inference_save_path=inference_save_path, real_test_imgname_list=test_imgname_list)
+FLAGS = get_flags_byname(cfgs.NET_NAME)
 
 
 def parse_args():
     """
     Parse input arguments
     """
-    parser = argparse.ArgumentParser(description='TestImgs...U need provide the test dir')
-    parser.add_argument('--data_dir', dest='data_dir',
-                        help='data path',
-                        default='demos', type=str)
-    parser.add_argument('--save_dir', dest='save_dir',
-                        help='demo imgs to save',
-                        default='inference_results', type=str)
-    parser.add_argument('--GPU', dest='GPU',
-                        help='gpu id ',
-                        default='0', type=str)
-
-    if len(sys.argv) == 1:
-        parser.print_help()
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description='Test FPN')
+    parser.add_argument('--weights', dest='weights',
+                        help='trained model weights',
+                        default=None, type=str)
+    parser.add_argument('--img_num', dest='img_num',
+                        help='test image numbers',
+                        default=None, type=int)
 
     args = parser.parse_args()
-
     return args
 
 
+def test(args):
+    with tf.Graph().as_default():
+
+        # img = tf.placeholder(shape=[None, None, 3], dtype=tf.uint8)
+
+        img_name_batch, img_batch, gtboxes_and_label_batch, num_objects_batch = \
+            next_batch(dataset_name=cfgs.DATASET_NAME,
+                       batch_size=cfgs.BATCH_SIZE,
+                       shortside_len=cfgs.SHORT_SIDE_LEN,
+                       is_training=False)
+
+        # ***********************************************************************************************
+        # *                                         share net                                           *
+        # ***********************************************************************************************
+        _, share_net = get_network_byname(net_name=cfgs.NET_NAME,
+                                          inputs=img_batch,
+                                          num_classes=None,
+                                          is_training=True,
+                                          output_stride=None,
+                                          global_pool=False,
+                                          spatial_squeeze=False)
+
+        # ***********************************************************************************************
+        # *                                            RPN                                              *
+        # ***********************************************************************************************
+        rpn = build_rpn.RPN(net_name=cfgs.NET_NAME,
+                            inputs=img_batch,
+                            gtboxes_and_label=None,
+                            is_training=False,
+                            share_head=cfgs.SHARE_HEAD,
+                            share_net=share_net,
+                            stride=cfgs.STRIDE,
+                            anchor_ratios=cfgs.ANCHOR_RATIOS,
+                            anchor_scales=cfgs.ANCHOR_SCALES,
+                            scale_factors=cfgs.SCALE_FACTORS,
+                            base_anchor_size_list=cfgs.BASE_ANCHOR_SIZE_LIST,  # P2, P3, P4, P5, P6
+                            level=cfgs.LEVEL,
+                            top_k_nms=cfgs.RPN_TOP_K_NMS,
+                            rpn_nms_iou_threshold=cfgs.RPN_NMS_IOU_THRESHOLD,
+                            max_proposals_num=cfgs.MAX_PROPOSAL_NUM,
+                            rpn_iou_positive_threshold=cfgs.RPN_IOU_POSITIVE_THRESHOLD,
+                            rpn_iou_negative_threshold=cfgs.RPN_IOU_NEGATIVE_THRESHOLD,
+                            rpn_mini_batch_size=cfgs.RPN_MINIBATCH_SIZE,
+                            rpn_positives_ratio=cfgs.RPN_POSITIVE_RATE,
+                            remove_outside_anchors=False,  # whether remove anchors outside
+                            rpn_weight_decay=cfgs.WEIGHT_DECAY[cfgs.NET_NAME])
+
+        # rpn predict proposals
+        rpn_proposals_boxes, rpn_proposals_scores = rpn.rpn_proposals()  # rpn_score shape: [300, ]
+
+        # ***********************************************************************************************
+        # *                                         Fast RCNN                                           *
+        # ***********************************************************************************************
+        fast_rcnn = build_fast_rcnn.FastRCNN(img_batch=img_batch,
+                                             feature_pyramid=rpn.feature_pyramid,
+                                             rpn_proposals_boxes=rpn_proposals_boxes,
+                                             rpn_proposals_scores=rpn_proposals_scores,
+                                             img_shape=tf.shape(img_batch),
+                                             roi_size=cfgs.ROI_SIZE,
+                                             scale_factors=cfgs.SCALE_FACTORS,
+                                             roi_pool_kernel_size=cfgs.ROI_POOL_KERNEL_SIZE,
+                                             gtboxes_and_label=None,
+                                             fast_rcnn_nms_iou_threshold=cfgs.FAST_RCNN_NMS_IOU_THRESHOLD,
+                                             fast_rcnn_maximum_boxes_per_img=100,
+                                             fast_rcnn_nms_max_boxes_per_class=cfgs.FAST_RCNN_NMS_MAX_BOXES_PER_CLASS,
+                                             show_detections_score_threshold=cfgs.FINAL_SCORE_THRESHOLD,
+                                             # show detections which score >= 0.6
+                                             num_classes=cfgs.CLASS_NUM,
+                                             fast_rcnn_minibatch_size=cfgs.FAST_RCNN_MINIBATCH_SIZE,
+                                             fast_rcnn_positives_ratio=cfgs.FAST_RCNN_POSITIVE_RATE,
+                                             fast_rcnn_positives_iou_threshold=cfgs.FAST_RCNN_IOU_POSITIVE_THRESHOLD,
+                                             use_dropout=False,
+                                             weight_decay=cfgs.WEIGHT_DECAY[cfgs.NET_NAME],
+                                             is_training=False,
+                                             level=cfgs.LEVEL)
+
+        fast_rcnn_decode_boxes, fast_rcnn_score, num_of_objects, detection_category = \
+            fast_rcnn.fast_rcnn_predict()
+
+        # train
+        init_op = tf.group(
+            tf.global_variables_initializer(),
+            tf.local_variables_initializer()
+        )
+
+        restorer, restore_ckpt = restore_model.get_restorer(checkpoint_path=args.weights)
+
+        config = tf.ConfigProto()
+        # config.gpu_options.per_process_gpu_memory_fraction = 0.5
+        config.gpu_options.allow_growth = True
+        with tf.Session(config=config) as sess:
+            sess.run(init_op)
+            if not restorer is None:
+                restorer.restore(sess, restore_ckpt)
+                print('restore model')
+
+            coord = tf.train.Coordinator()
+            threads = tf.train.start_queue_runners(sess, coord)
+
+            for _ in tqdm(range(args.img_num)):
+                _img_name_batch, _img_batch, _gtboxes_and_label_batch, _fast_rcnn_decode_boxes, \
+                _fast_rcnn_score, _detection_category \
+                    = sess.run([img_name_batch, img_batch, gtboxes_and_label_batch, fast_rcnn_decode_boxes,
+                                fast_rcnn_score, detection_category])
+
+                _img_batch = np.squeeze(_img_batch, axis=0)
+
+                _img_batch_fpn = help_utils.draw_box_cv(_img_batch,
+                                                        boxes=_fast_rcnn_decode_boxes,
+                                                        labels=_detection_category,
+                                                        scores=_fast_rcnn_score)
+                mkdir(cfgs.TEST_SAVE_PATH)
+                cv2.imwrite(cfgs.TEST_SAVE_PATH +
+                            '/{}_fpn.jpeg'.format(str(_img_name_batch[0])), _img_batch_fpn)
+
+                _gtboxes_and_label_batch = np.squeeze(_gtboxes_and_label_batch, axis=0)
+
+                temp_label = np.reshape(_gtboxes_and_label_batch[:, -1:], [-1, ]).astype(np.int64)
+                _img_batch_gt = help_utils.draw_box_cv(_img_batch,
+                                                       boxes=_gtboxes_and_label_batch[:, :-1],
+                                                       labels=temp_label,
+                                                       scores=None)
+
+                cv2.imwrite(cfgs.TEST_SAVE_PATH +
+                            '/{}_gt.jpeg'.format(str(_img_name_batch[0])), _img_batch_gt)
+
+            coord.request_stop()
+            coord.join(threads)
+
+
+def fpn_test(validate_data=None,
+             checkpoint_path=None,
+             graph=None,
+             img_name_batch=None,
+             gtboxes_and_label_batch=None,
+             num_objects_batch=None,
+             data_num=None):
+    with graph.as_default():
+
+        # img = tf.placeholder(shape=[None, None, 3], dtype=tf.uint8)
+
+        # ***********************************************************************************************
+        # *                                         share net                                           *
+        # ***********************************************************************************************
+        _, share_net = get_network_byname(net_name=cfgs.NET_NAME,
+                                          inputs=validate_data,
+                                          num_classes=None,
+                                          is_training=True,
+                                          output_stride=None,
+                                          global_pool=False,
+                                          spatial_squeeze=False)
+
+        # ***********************************************************************************************
+        # *                                            RPN                                              *
+        # ***********************************************************************************************
+        rpn = build_rpn.RPN(net_name=cfgs.NET_NAME,
+                            inputs=validate_data,
+                            gtboxes_and_label=None,
+                            is_training=False,
+                            share_head=cfgs.SHARE_HEAD,
+                            share_net=share_net,
+                            stride=cfgs.STRIDE,
+                            anchor_ratios=cfgs.ANCHOR_RATIOS,
+                            anchor_scales=cfgs.ANCHOR_SCALES,
+                            scale_factors=cfgs.SCALE_FACTORS,
+                            base_anchor_size_list=cfgs.BASE_ANCHOR_SIZE_LIST,  # P2, P3, P4, P5, P6
+                            level=cfgs.LEVEL,
+                            top_k_nms=cfgs.RPN_TOP_K_NMS,
+                            rpn_nms_iou_threshold=cfgs.RPN_NMS_IOU_THRESHOLD,
+                            max_proposals_num=cfgs.MAX_PROPOSAL_NUM,
+                            rpn_iou_positive_threshold=cfgs.RPN_IOU_POSITIVE_THRESHOLD,
+                            rpn_iou_negative_threshold=cfgs.RPN_IOU_NEGATIVE_THRESHOLD,
+                            rpn_mini_batch_size=cfgs.RPN_MINIBATCH_SIZE,
+                            rpn_positives_ratio=cfgs.RPN_POSITIVE_RATE,
+                            remove_outside_anchors=False,  # whether remove anchors outside
+                            rpn_weight_decay=cfgs.WEIGHT_DECAY[cfgs.NET_NAME])
+
+        # rpn predict proposals
+        rpn_proposals_boxes, rpn_proposals_scores = rpn.rpn_proposals()  # rpn_score shape: [300, ]
+
+        # ***********************************************************************************************
+        # *                                         Fast RCNN                                           *
+        # ***********************************************************************************************
+        fast_rcnn = build_fast_rcnn.FastRCNN(img_batch=validate_data,
+                                             feature_pyramid=rpn.feature_pyramid,
+                                             rpn_proposals_boxes=rpn_proposals_boxes,
+                                             rpn_proposals_scores=rpn_proposals_scores,
+                                             img_shape=tf.shape(validate_data),
+                                             roi_size=cfgs.ROI_SIZE,
+                                             scale_factors=cfgs.SCALE_FACTORS,
+                                             roi_pool_kernel_size=cfgs.ROI_POOL_KERNEL_SIZE,
+                                             gtboxes_and_label=None,
+                                             fast_rcnn_nms_iou_threshold=cfgs.FAST_RCNN_NMS_IOU_THRESHOLD,
+                                             fast_rcnn_maximum_boxes_per_img=100,
+                                             fast_rcnn_nms_max_boxes_per_class=cfgs.FAST_RCNN_NMS_MAX_BOXES_PER_CLASS,
+                                             show_detections_score_threshold=cfgs.FINAL_SCORE_THRESHOLD,
+                                             # show detections which score >= 0.6
+                                             num_classes=cfgs.CLASS_NUM,
+                                             fast_rcnn_minibatch_size=cfgs.FAST_RCNN_MINIBATCH_SIZE,
+                                             fast_rcnn_positives_ratio=cfgs.FAST_RCNN_POSITIVE_RATE,
+                                             fast_rcnn_positives_iou_threshold=cfgs.FAST_RCNN_IOU_POSITIVE_THRESHOLD,
+                                             use_dropout=False,
+                                             weight_decay=cfgs.WEIGHT_DECAY[cfgs.NET_NAME],
+                                             is_training=False,
+                                             level=cfgs.LEVEL)
+
+        fast_rcnn_decode_boxes, fast_rcnn_score, num_of_objects, detection_category = \
+            fast_rcnn.fast_rcnn_predict()
+
+        # train
+        init_op = tf.group(
+            tf.global_variables_initializer(),
+            tf.local_variables_initializer()
+        )
+
+        restorer, restore_ckpt = restore_model.get_restorer(checkpoint_path=checkpoint_path)
+
+        config = tf.ConfigProto()
+        # config.gpu_options.per_process_gpu_memory_fraction = 0.5
+        config.gpu_options.allow_growth = True
+        with tf.Session(config=config) as sess:
+            sess.run(init_op)
+            if not restorer is None:
+                restorer.restore(sess, restore_ckpt)
+                print('restore model')
+
+            coord = tf.train.Coordinator()
+            threads = tf.train.start_queue_runners(sess, coord)
+
+            for _ in tqdm(range(data_num)):
+                _img_name_batch, _img_batch, _gtboxes_and_label_batch, _fast_rcnn_decode_boxes, \
+                _fast_rcnn_score, _detection_category \
+                    = sess.run([img_name_batch, validate_data, gtboxes_and_label_batch, fast_rcnn_decode_boxes,
+                                fast_rcnn_score, detection_category])
+
+                _img_batch = np.squeeze(_img_batch, axis=0)
+
+                _img_batch_fpn = help_utils.draw_box_cv(_img_batch,
+                                                        boxes=_fast_rcnn_decode_boxes,
+                                                        labels=_detection_category,
+                                                        scores=_fast_rcnn_score)
+                mkdir(cfgs.TEST_SAVE_PATH)
+                cv2.imwrite(cfgs.TEST_SAVE_PATH +
+                            '/{}_fpn.jpeg'.format(str(_img_name_batch[0])), _img_batch_fpn)
+
+                _gtboxes_and_label_batch = np.squeeze(_gtboxes_and_label_batch, axis=0)
+
+                temp_label = np.reshape(_gtboxes_and_label_batch[:, -1:], [-1, ]).astype(np.int64)
+                _img_batch_gt = help_utils.draw_box_cv(_img_batch,
+                                                       boxes=_gtboxes_and_label_batch[:, :-1],
+                                                       labels=temp_label,
+                                                       scores=None)
+
+                cv2.imwrite(cfgs.TEST_SAVE_PATH +
+                            '/{}_gt.jpeg'.format(str(_img_name_batch[0])), _img_batch_gt)
+
+            coord.request_stop()
+            coord.join(threads)
+
+
 if __name__ == '__main__':
+    # args = parse_args()
+    # test(args)
+    graph = tf.Graph()
+    with graph.as_default():
+        # img = tf.placeholder(shape=[None, None, 3], dtype=tf.uint8)
 
-    args = parse_args()
-    print('Called with args:')
-    print(args)
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.GPU
-    test(args.data_dir,
-         inference_save_path=args.save_dir)
+        img_name_batch, img_batch, gtboxes_and_label_batch, num_objects_batch, data_num = \
+            next_batch(dataset_name=cfgs.DATASET_NAME,
+                       batch_size=cfgs.BATCH_SIZE,
+                       shortside_len=cfgs.SHORT_SIDE_LEN,
+                       is_training=False)
 
+    model_abs_path = '/home/lsq/py_projects/sedna/examples/incremental_learning/FPN_TensorFlow/output/layer/res101_trained_weights/v1_layer'
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    # get inference model.ckpt's path
+    checkpoint_path = tf.train.latest_checkpoint(model_abs_path)
+    fpn_test(validate_data=img_batch,
+             checkpoint_path=checkpoint_path,
+             graph=graph,
+             img_name_batch=img_name_batch,
+             gtboxes_and_label_batch=gtboxes_and_label_batch,
+             num_objects_batch=num_objects_batch,
+             data_num=data_num)
