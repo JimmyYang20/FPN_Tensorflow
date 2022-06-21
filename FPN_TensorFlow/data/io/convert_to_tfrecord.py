@@ -22,6 +22,7 @@ tf.app.flags.DEFINE_string('image_dir', 'JPEGImages/', 'image dir')
 tf.app.flags.DEFINE_string('save_name', 'train', 'save name')
 tf.app.flags.DEFINE_string('save_dir', cfgs.ROOT_PATH + '/data/tfrecords/', 'save name')
 tf.app.flags.DEFINE_string('img_format', '.jpeg', 'format of image')
+tf.app.flags.DEFINE_string('f', "", "kernel")
 FLAGS = tf.app.flags.FLAGS
 
 split = int('200100')

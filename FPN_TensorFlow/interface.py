@@ -745,8 +745,7 @@ def f1_score(y_true, y_pred):
     F_measure = np.sum(F) / 2
     print('\n{}\tR:{}\tP:{}\tmAP:{}\tF:{}'.format('Final', Recall, Precision, mAP, F_measure))
 
-    # return F_measure
-    return Recall
+    return F_measure
 
 def get_single_label_dict(predict_dict, gtboxes_dict, label):
     rboxes = {}
